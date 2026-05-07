@@ -1,36 +1,113 @@
 // Candle history endpoint with layered upstream strategies for resilience.
-// Tries each source in order; first success wins. Failures are reported with
-// per-source detail so the frontend can surface a meaningful error.
+// Yahoo Finance hard-rate-limits Vercel datacenter IPs (HTTP 429), so we lead
+// with Twelve Data (a CDN-style provider that does NOT block datacenter IPs)
+// when an API key is configured, and fall through to Yahoo + Stooq as backups.
 //
-//   1. Yahoo Finance v8 chart API, no auth (works most of the time).
-//   2. Yahoo Finance v8 chart API, with crumb cookie auth.
-//   3. Stooq CSV daily fallback (only useful for daily timeframes).
+//   1. Twelve Data         — if TWELVE_DATA_KEY is set. Covers all TFs.
+//   2. Yahoo (no auth)     — free but datacenter-blocked.
+//   3. Yahoo (with crumb)  — same blocking, last-ditch.
+//   4. Stooq CSV           — rock-solid for daily; no intraday.
+//
+// On total upstream failure, returns the last-known-good cached payload (up to
+// 1 hour stale) tagged with `stale:true`, so the user keeps seeing a chart.
 //
 // Response on success: { s:'ok', src, version, t, o, h, l, c, v }
-// Response on failure: { s:'no_data', error, tried:[{src,status,error,detail}], version }
+// Response on failure: { s:'no_data', error, tried:[{src,...}], version }
 
-const VERSION = 'multi-strategy-v1-2026-05-06';
+const VERSION = 'multi-strategy-v2-2026-05-06';
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
          + '(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
 
-// Module-scope crumb cache — survives across warm invocations.
 let _crumb = null;
 let _cookie = null;
 let _crumbTs = 0;
 const CRUMB_TTL = 50 * 60 * 1000;
 
-// Per-request timeout to avoid hanging Vercel functions on slow upstreams.
 const FETCH_TIMEOUT_MS = 8000;
+
+const FRESH_TTL = 60 * 1000;
+const STALE_TTL = 60 * 60 * 1000;
+const _cache = new Map();
+
+function cacheKey(symbol, interval, range) { return `${symbol}|${interval}|${range}`; }
+
+function cacheGet(key, allowStale) {
+  const e = _cache.get(key);
+  if (!e) return null;
+  const age = Date.now() - e.ts;
+  if (age <= FRESH_TTL) return { ...e, kind: 'fresh', age };
+  if (allowStale && age <= STALE_TTL) return { ...e, kind: 'stale', age };
+  return null;
+}
+
+function cacheSet(key, data) {
+  _cache.set(key, { data, ts: Date.now() });
+  if (_cache.size > 60) _cache.delete(_cache.keys().next().value);
+}
 
 async function timedFetch(url, init = {}) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
-  try {
-    return await fetch(url, { ...init, signal: ctrl.signal });
-  } finally {
-    clearTimeout(timer);
+  try { return await fetch(url, { ...init, signal: ctrl.signal }); }
+  finally { clearTimeout(timer); }
+}
+
+const TD_INTERVAL = {
+  '1m': '1min', '2m': '1min', '5m': '5min', '15m': '15min', '30m': '30min',
+  '60m': '1h',  '90m': '1h',  '1h':  '1h',
+  '1d': '1day', '5d': '1day', '1wk': '1week', '1mo': '1month', '3mo': '1month',
+};
+
+const TD_OUTPUTSIZE = {
+  '1d': 100, '5d': 500, '1mo': 800, '3mo': 800, '6mo': 200,
+  '1y': 300, '2y': 600, '5y': 1500, '10y': 3000, 'ytd': 300, 'max': 5000,
+};
+
+async function tryTwelveData(symbol, interval, range, apiKey) {
+  if (!apiKey) return { ok: false, error: 'TWELVE_DATA_KEY not configured' };
+
+  const tdInterval = TD_INTERVAL[interval] || '5min';
+  const outputsize = TD_OUTPUTSIZE[range]   || 500;
+
+  const params = new URLSearchParams({
+    symbol, interval: tdInterval,
+    outputsize: String(outputsize),
+    timezone: 'UTC',
+    apikey: apiKey,
+  });
+  const url = `https://api.twelvedata.com/time_series?${params}`;
+
+  const res = await timedFetch(url, { headers: { 'Accept': 'application/json' } });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    return { ok: false, status: res.status, error: `HTTP ${res.status}`, detail: body.slice(0, 200) };
   }
+
+  let json;
+  try { json = await res.json(); }
+  catch (_) { return { ok: false, status: 200, error: 'non-JSON response' }; }
+
+  if (json.status === 'error' || json.code) {
+    return { ok: false, status: 200,
+             error: json.message || `TD code ${json.code}`,
+             detail: JSON.stringify(json).slice(0, 200) };
+  }
+  if (!Array.isArray(json.values) || !json.values.length) {
+    return { ok: false, status: 200, error: 'empty values[]' };
+  }
+
+  const out = { t: [], o: [], h: [], l: [], c: [], v: [] };
+  for (let i = json.values.length - 1; i >= 0; i--) {
+    const v = json.values[i];
+    const t = Math.floor(new Date(v.datetime.replace(' ', 'T') + 'Z').getTime() / 1000);
+    const o = +v.open, h = +v.high, l = +v.low, c = +v.close;
+    if (!isFinite(o) || !isFinite(h) || !isFinite(l) || !isFinite(c) || !isFinite(t)) continue;
+    out.t.push(t); out.o.push(o); out.h.push(h); out.l.push(l); out.c.push(c);
+    out.v.push(v.volume ? +v.volume : 0);
+  }
+  if (out.t.length === 0) return { ok: false, status: 200, error: 'no valid bars' };
+  return { ok: true, ...out };
 }
 
 function readCookies(headers) {
@@ -43,8 +120,7 @@ function readCookies(headers) {
 
 async function fetchCrumb() {
   const consentRes = await timedFetch('https://fc.yahoo.com/', {
-    headers: { 'User-Agent': UA, 'Accept': '*/*' },
-    redirect: 'follow',
+    headers: { 'User-Agent': UA, 'Accept': '*/*' }, redirect: 'follow',
   });
   const cookie = readCookies(consentRes.headers);
   if (!cookie) throw new Error('no Set-Cookie from fc.yahoo.com');
@@ -97,9 +173,7 @@ function parseYahooJson(json) {
 
 async function tryYahoo(symbol, interval, range, withCrumb) {
   const params = new URLSearchParams({
-    interval, range,
-    includePrePost: 'false',
-    events: 'div,split',
+    interval, range, includePrePost: 'false', events: 'div,split',
   });
   const headers = { 'User-Agent': UA, 'Accept': 'application/json, */*' };
 
@@ -114,8 +188,7 @@ async function tryYahoo(symbol, interval, range, withCrumb) {
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    return { ok: false, status: res.status,
-             error: `HTTP ${res.status}`, detail: body.slice(0, 200) };
+    return { ok: false, status: res.status, error: `HTTP ${res.status}`, detail: body.slice(0, 200) };
   }
 
   let json;
@@ -136,8 +209,7 @@ async function tryStooq(symbol, range) {
 
   const csv = await res.text();
   if (!csv || csv.startsWith('<') || csv.length < 30) {
-    return { ok: false, status: 200, error: 'non-CSV response',
-             detail: csv.slice(0, 120) };
+    return { ok: false, status: 200, error: 'non-CSV response', detail: csv.slice(0, 120) };
   }
 
   const lines = csv.trim().split(/\r?\n/);
@@ -182,7 +254,13 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   if (req.query.ping) {
-    return res.status(200).json({ s: 'ok', version: VERSION, ts: Date.now() });
+    return res.status(200).json({
+      s: 'ok',
+      version: VERSION,
+      ts: Date.now(),
+      twelveDataConfigured: !!process.env.TWELVE_DATA_KEY,
+      cacheSize: _cache.size,
+    });
   }
 
   const symbol = (req.query.symbol || 'GLD').trim().toUpperCase();
@@ -198,44 +276,67 @@ export default async function handler(req, res) {
   if (!VALID_INT.has(interval)) return res.status(400).json({ s: 'no_data', error: `Invalid interval "${interval}"`, version: VERSION });
   if (!VALID_RNG.has(range))    return res.status(400).json({ s: 'no_data', error: `Invalid range "${range}"`,       version: VERSION });
 
+  const key = cacheKey(symbol, interval, range);
+
+  const fresh = cacheGet(key, false);
+  if (fresh) {
+    return res.status(200).json({ ...fresh.data, cache: 'fresh', cacheAge: fresh.age, version: VERSION });
+  }
+
+  const tdKey = process.env.TWELVE_DATA_KEY;
   const tried = [];
 
-  // Strategy 1 — Yahoo, no auth.
+  if (tdKey) {
+    try {
+      const r = await tryTwelveData(symbol, interval, range, tdKey);
+      if (r.ok) {
+        const payload = { s: 'ok', src: 'twelvedata', t: r.t, o: r.o, h: r.h, l: r.l, c: r.c, v: r.v };
+        cacheSet(key, payload);
+        return res.status(200).json({ ...payload, version: VERSION });
+      }
+      tried.push({ src: 'twelvedata', status: r.status, error: r.error, detail: r.detail });
+    } catch (e) {
+      tried.push({ src: 'twelvedata', error: String(e.message || e).slice(0, 200) });
+    }
+  } else {
+    tried.push({ src: 'twelvedata', skipped: 'TWELVE_DATA_KEY not set in Vercel env' });
+  }
+
   try {
     const r = await tryYahoo(symbol, interval, range, false);
     if (r.ok) {
-      return res.status(200).json({ s: 'ok', src: 'yahoo', version: VERSION,
-        t: r.t, o: r.o, h: r.h, l: r.l, c: r.c, v: r.v });
+      const payload = { s: 'ok', src: 'yahoo', t: r.t, o: r.o, h: r.h, l: r.l, c: r.c, v: r.v };
+      cacheSet(key, payload);
+      return res.status(200).json({ ...payload, version: VERSION });
     }
     tried.push({ src: 'yahoo', status: r.status, error: r.error, detail: r.detail });
+
+    if (r.status !== 429) {
+      try {
+        const r2 = await tryYahoo(symbol, interval, range, true);
+        if (r2.ok) {
+          const payload = { s: 'ok', src: 'yahoo-crumb', t: r2.t, o: r2.o, h: r2.h, l: r2.l, c: r2.c, v: r2.v };
+          cacheSet(key, payload);
+          return res.status(200).json({ ...payload, version: VERSION });
+        }
+        tried.push({ src: 'yahoo-crumb', status: r2.status, error: r2.error, detail: r2.detail });
+      } catch (e) {
+        tried.push({ src: 'yahoo-crumb', error: String(e.message || e).slice(0, 200) });
+      }
+    } else {
+      tried.push({ src: 'yahoo-crumb', skipped: 'shared 429 rate limit' });
+    }
   } catch (e) {
     tried.push({ src: 'yahoo', error: String(e.message || e).slice(0, 200) });
   }
 
-  // Strategy 2 — Yahoo with crumb. Retry once with fresh crumb on 401/403.
-  for (const attempt of ['cached', 'fresh']) {
-    try {
-      if (attempt === 'fresh') _crumbTs = 0;
-      const r = await tryYahoo(symbol, interval, range, true);
-      if (r.ok) {
-        return res.status(200).json({ s: 'ok', src: `yahoo-crumb-${attempt}`, version: VERSION,
-          t: r.t, o: r.o, h: r.h, l: r.l, c: r.c, v: r.v });
-      }
-      tried.push({ src: `yahoo-crumb-${attempt}`, status: r.status, error: r.error, detail: r.detail });
-      if (r.status !== 401 && r.status !== 403) break;
-    } catch (e) {
-      tried.push({ src: `yahoo-crumb-${attempt}`, error: String(e.message || e).slice(0, 200) });
-      break;
-    }
-  }
-
-  // Strategy 3 — Stooq fallback (daily intervals only).
   if (DAILY_INTERVALS.has(interval)) {
     try {
       const r = await tryStooq(symbol, range);
       if (r.ok) {
-        return res.status(200).json({ s: 'ok', src: 'stooq', version: VERSION,
-          t: r.t, o: r.o, h: r.h, l: r.l, c: r.c, v: r.v });
+        const payload = { s: 'ok', src: 'stooq', t: r.t, o: r.o, h: r.h, l: r.l, c: r.c, v: r.v };
+        cacheSet(key, payload);
+        return res.status(200).json({ ...payload, version: VERSION });
       }
       tried.push({ src: 'stooq', status: r.status, error: r.error, detail: r.detail });
     } catch (e) {
@@ -243,6 +344,18 @@ export default async function handler(req, res) {
     }
   } else {
     tried.push({ src: 'stooq', skipped: 'intraday not supported' });
+  }
+
+  const stale = cacheGet(key, true);
+  if (stale && stale.kind === 'stale') {
+    return res.status(200).json({
+      ...stale.data,
+      stale: true,
+      cacheAge: stale.age,
+      version: VERSION,
+      warning: 'serving stale cache; all live sources failed',
+      tried,
+    });
   }
 
   return res.status(502).json({
